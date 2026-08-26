@@ -206,8 +206,41 @@ HSA_TOOLS_ROCPROFILER_V1_TOOLS = 0
 GLOG_minloglevel / GLOG_logtostderr / GLOG_alsologtostderr / GLOG_stderrthreshold
 ```
 
-新进程启动时如果这个变量**已经存在**，注册逻辑会认为"已经注册过"而走短路分支，
-于是 PyTorch 的 kineto 拿不到 dispatch 回调，profiler 里一个 device 事件都没有。
+新进程启动时如果这个变量**已经存在**，rocprofiler-register 会**强制把它指向的库
+dlopen 进来、装成本进程的 profiling tool**。ROCm 的 tracing 后端是单消费者，
+rocprofiler-sdk 占住 API table 拦截之后，PyTorch 的 kineto 就拿不到 dispatch 回调，
+profiler 里一个 device 事件都没有——**等价于每个后代进程都被隐式套上了一层
+`rocprofv3`**（正是第 7 节那个"两者不能同时用"的坑，同一个机制）。
+
+代码在 `rocprofiler-register/source/lib/rocprofiler-register/rocprofiler_register.cpp`
+的 `rocp_reg_scan_for_tools()`：
+
+```cpp
+auto _rocp_reg_lib = get_env("ROCPROFILER_REGISTER_LIBRARY", "");
+bool _force_tool   = get_env("ROCPROFILER_REGISTER_FORCE_LOAD",
+                             !_rocp_reg_lib.empty() || !_rocp_tool_libs.empty());
+bool _found_tool   = (rocprofiler_configure || _configure_func || _force_tool);
+
+if (_found_tool) {
+    if (rocprofiler_lib_handle && rocprofiler_lib_config_fn)  // 进程内静态缓存
+        return rocp_scan_data{...};                           // 与环境变量无关
+    if (_rocp_reg_lib.empty()) _rocp_reg_lib = rocprofiler_lib_name;
+    std::tie(handle, config_fn) = rocp_load_rocprofiler_lib(_rocp_reg_lib);  // dlopen 并挂上
+}
+```
+
+关键在于 `_force_tool` 的**默认值就是 `!_rocp_reg_lib.empty()`**：变量非空 ⇒
+`_force_tool` 为真 ⇒ `_found_tool` 为真 ⇒ 走进 dlopen 分支。函数开头那处 `return`
+是**进程内的静态缓存**，只在同一进程第二次调用时生效，与环境变量无关。
+
+这也把本坑最反直觉的不对称解释清楚了：
+
+| | 进程启动时的变量 | `_force_tool` | sdk 是否被挂成 tool | kineto |
+|---|---|---|---|---|
+| 设置者（父） | 空 | false | 否 | **SEES** ✅ |
+| 继承者（子） | 非空 | **true** | **是** | **BLIND** ❌ |
+
+第 5 节的 `sitecustomize` 之所以有效，就是把子进程还原成"启动时变量为空"的状态。
 
 实测逐个排除，六个泄漏变量里**只有 `ROCPROFILER_REGISTER_LIBRARY` 是真凶**：
 
@@ -297,11 +330,35 @@ device time。对几百 µs 以上的 kernel 可忽略；很小的 kernel 会有
 | 镜像 | `rocm/atom-dev:sglang-v0.5.15.post1-nightly_20260811` |
 | 实测中招的软件 | sglang 0.5.15.post1、aiter（`gemm_moe_tune.py` / `mp_tuner`） |
 
+第二次复现（2026-08-26）：**MI308X (gfx942)**，同一镜像、torch 2.13.0+rocm7.14.0，
+sglang TP4 的 4 个 scheduler rank 全是 CPU-only trace；挂上 `sitecustomize` 后
+同一条采集路径 `kernel: 0` → `kernel: 11370`（`ac2g` / `cuda_runtime` /
+`gpu_user_annotation` / `gpu_memcpy` 也一并出现）。说明与具体 GPU 型号无关。
+
+### 版本门控：只有新版 rocprofiler-sdk 会注入
+
+2026-08-26 在 MI308X (gfx942) 上做了跨容器对照，同一台机器四个容器：
+
+| 容器 ROCm | 形态 | `librocprofiler-sdk` 里引用该变量 | HIP init 后是否注入 | spawn 子进程 kineto |
+|---|---|---|---|---|
+| **7.14** | pip (`_rocm_sdk_*`) | **4 处** | **注入** | **kernel=0** ❌ |
+| **7.14** | pip (`_rocm_sdk_*`) | **4 处** | **注入** | ❌ |
+| 7.2.4 | 系统 `/opt/rocm` | 0 处 | 不注入 | kernel=5 ✅ |
+| 7.2.3 | 系统 `/opt/rocm` | 0 处 | 不注入 | ✅ |
+
+静态判据（不碰 GPU，可以安全地对别人正在跑的容器执行）：
+
+```bash
+strings -a $(find / -xdev -name 'librocprofiler-sdk.so*' | head -1) \
+  | grep -c ROCPROFILER_REGISTER_LIBRARY      # 0 = 不会中招；非 0 = 有风险
+```
+
+注意**变的是写入端，不是读取端**：`librocprofiler-register.so` 在所有版本里都一样
+（都引用该变量、都 import `setenv`），一直支持这个协议；是新版 `librocprofiler-sdk`
+才开始在自我登记时把自己的路径回写进环境。
+
 **推测但未验证**（不要当成结论）：
 
-- 系统安装的 ROCm（`/opt/rocm`）下机制应当相同，只是泄漏的路径会指向
-  `/opt/rocm/lib/...`。本环境没有系统 ROCm，无法验证。
-- 其他 ROCm/torch 版本是否同样注入该变量、以及从哪个版本开始，**未测**。
 - 非 Python 的 HSA 程序（C++ 直接调 HIP + kineto）按机制推测同样受影响，未测。
 - **NVIDIA 不受影响**——这是 rocprofiler 特有的机制。
 
