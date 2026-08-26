@@ -206,6 +206,18 @@ HSA_TOOLS_ROCPROFILER_V1_TOOLS = 0
 GLOG_minloglevel / GLOG_logtostderr / GLOG_alsologtostderr / GLOG_stderrthreshold
 ```
 
+实测逐个排除，六个泄漏变量里**只有 `ROCPROFILER_REGISTER_LIBRARY` 是真凶**：
+
+| 环境 | 结果 |
+|---|---|
+| 完整泄漏环境 | blind（复现）|
+| minus `GLOG_*`（4 个逐个试） | blind |
+| minus `HSA_TOOLS_ROCPROFILER_V1_TOOLS` | blind |
+| **minus `ROCPROFILER_REGISTER_LIBRARY`** | **SEES** ✅ |
+
+补充：值必须是**可加载的库**。指向一个不存在的路径会让 HIP 初始化直接失败
+（`RuntimeError: CUDA unknown error`），空字符串则无害。
+
 新进程启动时如果这个变量**已经存在**，rocprofiler-register 会**强制把它指向的库
 dlopen 进来、装成本进程的 profiling tool**。ROCm 的 tracing 后端是单消费者，
 rocprofiler-sdk 占住 API table 拦截之后，PyTorch 的 kineto 就拿不到 dispatch 回调，
@@ -242,17 +254,6 @@ if (_found_tool) {
 
 第 5 节的 `sitecustomize` 之所以有效，就是把子进程还原成"启动时变量为空"的状态。
 
-实测逐个排除，六个泄漏变量里**只有 `ROCPROFILER_REGISTER_LIBRARY` 是真凶**：
-
-| 环境 | 结果 |
-|---|---|
-| 完整泄漏环境 | blind（复现）|
-| minus `GLOG_*`（4 个逐个试） | blind |
-| minus `HSA_TOOLS_ROCPROFILER_V1_TOOLS` | blind |
-| **minus `ROCPROFILER_REGISTER_LIBRARY`** | **SEES** ✅ |
-
-补充：值必须是**可加载的库**。指向一个不存在的路径会让 HIP 初始化直接失败
-（`RuntimeError: CUDA unknown error`），空字符串则无害。
 
 ### 为什么 `os.environ` 看不到
 
