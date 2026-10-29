@@ -10,14 +10,25 @@ sglang 里制造这些"晚来的队列"的，是多 tokenizer worker 在 warmup 
 
 ## 现象
 
-1. **只有第一张卡上的 rank 慢**（PP0 或 TP0）。trace 里任意类型的 kernel 偶发被拉长，超出部分量子化在 11–14.5 ms，
-   起点间隔也有规律（多出 1 个队列时每 66 ms 一次，多出 5 个时每 30–33 ms 一次）。其他 rank 干净。换卡（把服务放到另一组 GPU）长尾跟着第一张可见卡走。
-2. **`--tokenizer-worker-num` 越大越慢，而且同一配置每次重启结果不同**：tw=4 实测一次 0 长尾、一次每 forward 4.6 次；
-   tw=8 同一口径（C20 warm）一次 125.2k/卡、一次 175.6k/卡；tw=16 每次挂起约 206 ms，forward 从 0.24 s 变成 5.6–7.6 s，吞吐约为正常的 1/26。
-3. dmesg：`amdgpu 0000:xx:00.0: amdgpu: Runlist is getting oversubscribed due to too many queues. Expect reduced ROCm performance.`
-   （PCI 地址就是第一张卡；只在"进入过订阅"那一刻打一次，所以行数和长尾次数无关，而且环形缓冲会滚动，要按时间戳数。）
-4. `rocm-smi` / KFD sysfs 里，每个 tokenizer worker 在第一张卡上要么 2 MB（只做过 `torch.cuda.is_available()`），
-   要么约 682 MB；后者 `cu_occupancy` 一直是 0。
+表面上看到的（不用 profiler）：
+
+1. **吞吐明显低于预期，而且同一个配置每次重启都不一样**：多模态模型、`--tokenizer-worker-num` > 1 时，有的启动正常，
+   有的启动整体慢一截，而且从启动到退出一直慢，不是只慢一阵（实测 MiniMax-M3.1-Flash PP4 prefill：tw=8 正常约 200k/卡，
+   中招时 107k–175k/卡；tw=16 吞吐约为正常的 1/26）。等 warmup 结束、server 就绪后再压测也一样。
+2. **`--tokenizer-worker-num` 越大越容易慢、越慢**；降到 1 反而"变快"（但 1 会被前端 tokenize 卡住，见 #2）。
+3. **只有第一张可见卡忙**：`rocm-smi` 里第一张卡（PP0 / TP0）利用率长期 100%、功耗明显高于其他卡，PP 的后几张卡大部分时间
+   利用率为 0（都在等它）；换一组 GPU 跑，慢的还是"第一张可见卡"，不是某张物理卡。
+4. **第一张卡上多出几个"tokenizer"进程**：`rocm-smi --showpids` / KFD sysfs 里，若干个 `sglang::tokenizer_worker` 在第一张卡上
+   各占约 682 MB 显存（其余只有 2 MB），但从不使用计算单元（`cu_occupancy` 一直是 0）。占 682 MB 的个数 ≥ 4 时就慢。
+5. dmesg：`amdgpu 0000:xx:00.0: amdgpu: Runlist is getting oversubscribed due to too many queues. Expect reduced ROCm performance.`
+   （PCI 地址就是第一张卡；只在"进入过订阅"那一刻打一次，所以行数和慢的程度无关，而且环形缓冲会滚动，要按时间戳数。）
+
+trace 里看到的（torch profiler）：
+
+6. 只有第一张卡的 rank 的 trace 里，任意类型的 kernel（GEMM、attention、MoE，甚至 40 us 的 elementwise）偶发被拉长，超出部分
+   量子化在 11–14.5 ms，起点间隔也有规律（多出 1 个队列时每 66 ms 一次，多出 5 个时每 30–33 ms 一次）；没被打中的 kernel
+   也慢几个百分点。计算流 100% 忙、没有 idle，所以看起来像"kernel 本身变慢"。其他 rank 干净，forward 时间只有它的一半左右。
+   tw=4 实测一次 0 长尾、一次每 forward 4.6 次；tw=16 每次挂起约 206 ms，forward 从 0.24 s 变成 5.6–7.6 s。
 
 ## 快速判断
 
@@ -60,6 +71,11 @@ sglang 里的来源（实测，`kfdtrace` 栈）：每个 tokenizer worker 的 l
 处理到图片的 worker 走 `base_processor._call_processor` → `_fast_image_processor_device()` 返回 `cuda:{base_gpu_id}` →
 transformers `process_image` 里 `image.to(device)`，在第一张卡上建 context（2 compute + 1 SDMA，有时 3 compute + 0 SDMA）。
 所以中招的 worker 数是随机的（tw=8 实测 4、6 个；tw=16 实测 10 个；tw=4 实测 3、4 个）。上线后真实的图片请求还会让更多 worker 建 context。
+
+**warmup 是一次性的，但影响持续整个服务生命周期**：worker 处理完图片后，HIP context、它的 compute queue 和 PyTorch 缓存的
+约 682 MB 显存都不会释放（HIP 没有归还队列的接口，进程退出才销毁），所以这些队列在 warmup 之后一直挂在 runlist 前面。
+压测若只发文本，不会再新建 context，中招个数在 warmup 结束时就定了：总数 > 24 则这次启动从头到尾都慢，≤ 24 则整次启动都正常。
+所以"等 warmup 结束、server 就绪后再压测"避不开这个问题。
 
 **无关的维度（都实测排除过）**：
 - 辅助队列是否空闲——完全空闲、rptr==wptr 不动的队列照样触发（只要排在前面）。
